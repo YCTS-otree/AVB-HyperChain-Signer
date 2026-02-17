@@ -374,6 +374,9 @@ def main():
     ap.add_argument("--vbmeta_dir", help="包含 vbmeta 镜像的目录（自动匹配 *vbmeta*.img）")
     ap.add_argument("--partition_name", help="手动指定分区名（覆盖自动解析）")
     ap.add_argument("--force", action="store_true", help="强制继续（一些警告会变为可放行）")
+    if len(sys.argv) == 1:
+        ap.print_help()
+        sys.exit(0)
     args = ap.parse_args()
 
     img = Path(args.img_patched).resolve()
