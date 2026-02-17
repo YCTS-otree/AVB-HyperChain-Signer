@@ -36,6 +36,7 @@ from typing import Dict, List, Optional, Tuple
 # ------------------- avbtool 输出解析（够用就行，别搞成反编译器） -------------------
 RE_ALGO = re.compile(r"^\s*Algorithm:\s*(.+?)\s*$", re.MULTILINE)
 RE_PUBKEY_SHA1 = re.compile(r"^\s*Public key\s*\(sha1\)\s*:\s*([0-9a-fA-F]{40})\s*$", re.MULTILINE)
+RE_PUBKEY_SHA256 = re.compile(r"^\s*Public key\s*\(sha256\)\s*:\s*([0-9a-fA-F]{64})\s*$", re.MULTILINE)
 RE_PART_NAME = re.compile(r"^\s*Partition Name:\s*([A-Za-z0-9_]+)\s*$", re.MULTILINE)
 RE_PART_SIZE = re.compile(r"^\s*Partition size:\s*([0-9]+)\s+bytes\s*$", re.MULTILINE)
 RE_RB_INDEX_LOC = re.compile(r"^\s*Rollback Index Location:\s*([0-9]+)\s*$", re.MULTILINE)
@@ -91,6 +92,19 @@ def run_avbtool(args_list: List[str]) -> Tuple[int, str, str]:
     r = subprocess.run(cmd, capture_output=True, text=True)
     return r.returncode, r.stdout, r.stderr
 
+def print_banner(title: str) -> None:
+    print(f"\n=== {title} ===")
+
+def print_cmd_result(title: str, cmd: List[str], code: int, out: str, err: str, show_stdout: bool) -> None:
+    print(f"[*] {title}")
+    print(f"    CMD : {' '.join(cmd)}")
+    print(f"    Code: {code}")
+    if show_stdout:
+        print("    ----- STDOUT -----")
+        print(out.rstrip() or "(empty)")
+        print("    ----- STDERR -----")
+        print(err.rstrip() or "(empty)")
+
 def clean_keys(inputs: List[str]) -> List[Path]:
     exts = {".pem", ".key", ".pk8"}
     out: List[Path] = []
@@ -124,17 +138,22 @@ def extract_pubkey_bin_from_pem(pem: Path, out_bin: Path) -> None:
     if code != 0:
         raise RuntimeError(f"extract_public_key 失败：{pem}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
 
-def load_keys(pem_files: List[Path]) -> List[Dict]:
+def load_keys(pem_files: List[Path], show_stdout: bool) -> List[Dict]:
     keys: List[Dict] = []
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         for pem in pem_files:
             try:
                 pubbin = td / (pem.stem + ".pub.bin")
-                extract_pubkey_bin_from_pem(pem, pubbin)
+                cmd = ["extract_public_key", "--key", str(pem), "--output", str(pubbin)]
+                code, out, err = run_avbtool(cmd)
+                print_cmd_result(f"解析公钥: {pem.name}", cmd, code, out, err, show_stdout)
+                if code != 0:
+                    raise RuntimeError(f"extract_public_key 失败: {pem}")
                 keys.append({
                     "path": pem,
                     "sha1": hash_file(pubbin, "sha1"),
+                    "sha256": hash_file(pubbin, "sha256"),
                 })
             except Exception:
                 # 非 PEM 私钥格式就跳过
@@ -173,6 +192,10 @@ def info_image(img: Path) -> Dict:
     m = RE_PUBKEY_SHA1.search(out)
     if m:
         top_sha1 = m.group(1).lower()
+    top_sha256 = None
+    m = RE_PUBKEY_SHA256.search(out)
+    if m:
+        top_sha256 = m.group(1).lower()
     part_name = None
     m = RE_PART_NAME.search(out)
     if m:
@@ -190,6 +213,7 @@ def info_image(img: Path) -> Dict:
         "raw": out,
         "algorithm": algo,
         "top_sha1": top_sha1,
+        "top_sha256": top_sha256,
         "partition_name": part_name,
         "partition_size": part_size,
         "rollback_index_location": rb_loc,
@@ -198,8 +222,9 @@ def info_image(img: Path) -> Dict:
         "referenced_parts": referenced_parts,
     }
 
-def try_erase_footer(img: Path) -> None:
+def try_erase_footer(img: Path, show_stdout: bool) -> None:
     code, out, err = run_avbtool(["erase_footer", "--image", str(img)])
+    print_cmd_result(f"尝试清除 footer: {img.name}", ["erase_footer", "--image", str(img)], code, out, err, show_stdout)
     if code == 0:
         print(f"[*] erase_footer OK: {img.name}")
     else:
@@ -213,10 +238,10 @@ def resign_footer_image_inplace(
     partition_size: int,
     use_hashtree: bool,
     rollback_index_location: Optional[int],
+    show_stdout: bool,
 ) -> None:
-    # inplace: 先备份，然后直接在原文件上操作
     backup_file(img)
-    try_erase_footer(img)
+    try_erase_footer(img, show_stdout)
     cmd = []
     if use_hashtree:
         cmd = [
@@ -239,6 +264,7 @@ def resign_footer_image_inplace(
     if rollback_index_location is not None:
         cmd += ["--rollback_index_location", str(rollback_index_location)]
     code, out, err = run_avbtool(cmd)
+    print_cmd_result(f"重签分区镜像: {img.name}", cmd, code, out, err, show_stdout)
     if code != 0:
         raise RuntimeError(f"重签失败：{img}\nCMD: {' '.join(cmd)}\nSTDOUT:\n{out}\nSTDERR:\n{err}")
     print(f"[+] Signed inplace: {img.name}")
@@ -341,6 +367,7 @@ def build_new_parent_vbmeta(
     stripped_parent: Path,
     extra_desc_vbmeta: Path,
     out_vbmeta_small: Path,
+    show_stdout: bool,
 ) -> None:
     """
     make_vbmeta_image:
@@ -357,6 +384,7 @@ def build_new_parent_vbmeta(
         "--include_descriptors_from_image", str(extra_desc_vbmeta),
     ]
     code, out, err = run_avbtool(cmd)
+    print_cmd_result(f"重建父 vbmeta: {parent_vbmeta.name}", cmd, code, out, err, show_stdout)
     if code != 0:
         raise RuntimeError(
             f"重建父 vbmeta 失败：{parent_vbmeta}\nCMD: {' '.join(cmd)}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
@@ -373,6 +401,8 @@ def main():
     ap.add_argument("--vbmetas", nargs="*", help="所有 vbmeta*.img（Algorithm NONE 必需）")
     ap.add_argument("--vbmeta_dir", help="包含 vbmeta 镜像的目录（自动匹配 *vbmeta*.img）")
     ap.add_argument("--partition_name", help="手动指定分区名（覆盖自动解析）")
+    ap.add_argument("--out_dir", default="./signed_img", help="输出目录（所有签名产物统一输出到该目录）")
+    ap.add_argument("--show_stdout", action="store_true", help="打印 avbtool 的 stdout/stderr")
     ap.add_argument("--force", action="store_true", help="强制继续（一些警告会变为可放行）")
     args = ap.parse_args()
 
@@ -386,14 +416,23 @@ def main():
     if not orig.exists():
         die(f"找不到 orig_img：{orig}")
 
+    out_dir = Path(args.out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[*] 输出目录: {out_dir}")
+
     # keys
     key_candidates = clean_keys(args.keys)
     if not key_candidates:
         die("没有找到任何 key 文件（.pem/.key/.pk8）")
 
-    keys = load_keys(key_candidates)
+    keys = load_keys(key_candidates, args.show_stdout)
     if not keys:
         die("没有任何 key 能通过 avbtool extract_public_key（请确认 PEM 私钥格式）")
+    print_banner("已加载的 PEM key 指纹")
+    for k in keys:
+        print(f"- {k['path'].name}")
+        print(f"  sha1   : {k['sha1']}")
+        print(f"  sha256 : {k['sha256']}")
     print(f"[*] Loaded usable keys: {len(keys)}")
 
     img_info = info_image(img)
@@ -410,8 +449,9 @@ def main():
     # 你要求：partition_size = 文件大小（RAW dump）
     partition_size = img.stat().st_size
 
-    print(f"[*] orig_img     : {orig.name}")
-    print(f"[*] img_patched  : {img.name}")
+    print_banner("目标镜像基础信息")
+    print(f"[*] orig_img     : {orig}")
+    print(f"[*] img_patched  : {img}")
     print(f"[*] Partition    : {partition_name}")
     print(f"[*] Algorithm    : {algorithm}")
     print(f"[*] Size(patched): {partition_size} bytes (RAW dump assumed)")
@@ -419,11 +459,36 @@ def main():
 
     # 匹配 key（优先 orig）
     key_pem = match_key_sha1(orig_info.get("top_sha1"), keys) or match_key_sha1(img_info.get("top_sha1"), keys)
+    print(f"[*] Top pubkey sha1(orig): {orig_info.get('top_sha1') or '(not found)'}")
+    print(f"[*] Top pubkey sha1(img) : {img_info.get('top_sha1') or '(not found)'}")
+
+    print_banner("镜像解析与匹配结果")
+    all_to_show: List[Tuple[str, Path, Dict]] = [("img_patched", img, img_info), ("orig_img", orig, orig_info)]
+    for v in sorted({p.resolve() for p in (([Path(x).resolve() for x in args.vbmetas] if args.vbmetas else []) + ([q for q in Path(args.vbmeta_dir).resolve().rglob("*.img") if "vbmeta" in q.name.lower()] if args.vbmeta_dir and Path(args.vbmeta_dir).resolve().exists() else []))}):
+        try:
+            all_to_show.append(("vbmeta", v, info_image(v)))
+        except Exception:
+            continue
+    for tag, path, ii in all_to_show:
+        print("\n" + "=" * 80)
+        print(f"[{tag}] {path}")
+        print("-" * 80)
+        print(f"Algorithm            : {ii.get('algorithm') or '(unknown)'}")
+        sha1 = ii.get("top_sha1")
+        sha1_match = match_key_sha1(sha1, keys)
+        print(f"Top pubkey sha1      : {sha1 or '(not found)'}" + (f"  -> {sha1_match.name}" if sha1_match else ""))
+        print(f"Top pubkey sha256    : {ii.get('top_sha256') or '(not found)'}")
+        parts = ii.get("referenced_parts") or []
+        print(f"Referenced partitions: {', '.join(parts) if parts else '(none)'}")
 
     # ---------------- Case 1: Algorithm != NONE -> sign image itself ----------------
     if algorithm.upper() != "NONE":
         if not key_pem:
             die("找不到匹配的 PEM（请补充/更换 keys）")
+
+        signed_img = out_dir / img.name
+        shutil.copy2(img, signed_img)
+        print(f"[*] 已复制待签镜像到输出目录: {signed_img}")
 
         use_hashtree = bool(orig_info.get("use_hashtree") or img_info.get("use_hashtree"))
         rb_loc = orig_info.get("rollback_index_location") or img_info.get("rollback_index_location")
@@ -431,15 +496,16 @@ def main():
         print(f"[*] Key match : {key_pem.name}")
         print(f"[*] Mode      : resign image inplace ({'hashtree' if use_hashtree else 'hash'})")
         resign_footer_image_inplace(
-            img=img,
+            img=signed_img,
             algorithm=algorithm,
             key_pem=key_pem,
             partition_name=partition_name,
             partition_size=partition_size,
             use_hashtree=use_hashtree,
             rollback_index_location=rb_loc,
+            show_stdout=args.show_stdout,
         )
-        print("[✓] Done.")
+        print(f"[✓] Done. 输出文件: {signed_img}")
         return
 
     # ---------------- Case 2: Algorithm == NONE -> sign parent vbmeta ----------------
@@ -492,10 +558,13 @@ def main():
     print(f"[*] Parent key   : {parent_key.name}")
 
     # 备份父 vbmeta（你要求输出一致，这里就是覆盖同名）
-    backup_file(parent_vbmeta)
+    out_parent = out_dir / parent_vbmeta.name
+    shutil.copy2(parent_vbmeta, out_parent)
+    backup_file(out_parent)
+    print(f"[*] 已复制父 vbmeta 到输出目录: {out_parent}")
 
     # 1) 先把父 vbmeta 的旧 descriptor 去掉（只改 descriptors_size 和 descriptors 区内部，不改变文件大小）
-    parent_bytes = parent_vbmeta.read_bytes()
+    parent_bytes = out_parent.read_bytes()
     try:
         stripped_bytes, removed_cnt, new_desc_size = vbmeta_strip_partition_descriptors_keep_size(parent_bytes, partition_name)
     except Exception as e:
@@ -553,16 +622,17 @@ def main():
         # 3) 重建并签名父 vbmeta（小体积产物）
         out_small = td / "parent_new_small.img"
         build_new_parent_vbmeta(
-            parent_vbmeta=parent_vbmeta,
+            parent_vbmeta=out_parent,
             parent_algo=parent_algo,
             parent_key=parent_key,
             stripped_parent=stripped_parent_path,
             extra_desc_vbmeta=extra_desc,
             out_vbmeta_small=out_small,
+            show_stdout=args.show_stdout,
         )
 
         # 4) pad 到原 vbmeta 分区大小，并原地覆盖
-        parent_size = parent_vbmeta.stat().st_size  # RAW dump 分区大小
+        parent_size = out_parent.stat().st_size  # RAW dump 分区大小
         new_small_bytes = out_small.read_bytes()
         try:
             new_padded = pad_to_size(new_small_bytes, parent_size)
@@ -573,8 +643,8 @@ def main():
                 "你可以把 parent vbmeta 的 info_image 输出贴我，我再把去重规则收紧到 descriptor 类型级别。"
             )
 
-        parent_vbmeta.write_bytes(new_padded)
-        print(f"[+] Signed & padded parent vbmeta inplace: {parent_vbmeta.name}")
+        out_parent.write_bytes(new_padded)
+        print(f"[+] Signed & padded parent vbmeta: {out_parent}")
 
     print("[✓] Done.")
 
