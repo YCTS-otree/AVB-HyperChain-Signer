@@ -43,6 +43,10 @@ RE_RB_INDEX_LOC = re.compile(r"^\s*Rollback Index Location:\s*([0-9]+)\s*$", re.
 RE_HASH_DESC = re.compile(r"^\s*Hash descriptor:\s*$", re.MULTILINE)
 RE_HASHTREE_DESC = re.compile(r"^\s*Hashtree descriptor:\s*$", re.MULTILINE)
 RE_ANY_PARTITION_NAME = re.compile(r"^\s*Partition Name:\s*([A-Za-z0-9_]+)\s*$", re.MULTILINE)
+RE_DESC_PARTITION_NAME = re.compile(
+    r"(?:Hash descriptor:|Hashtree descriptor:).*?^\s*Partition Name:\s*([A-Za-z0-9_]+)\s*$",
+    re.MULTILINE | re.DOTALL,
+)
 
 SPARSE_MAGIC = 0xED26FF3A
 
@@ -224,6 +228,121 @@ def info_image(img: Path) -> Dict:
         "use_hash": bool(RE_HASH_DESC.search(out)),
         "referenced_parts": referenced_parts,
     }
+
+def descriptor_partition_count(info_raw: str, part_name: str) -> int:
+    """
+    统计 vbmeta descriptors 里某分区出现次数（Hash/Hashtree）。
+    用于 Algorithm=NONE 路径的安全校验：确认目标 descriptor 只保留 1 份。
+    """
+    target = part_name.strip()
+    if not target:
+        return 0
+    return sum(1 for p in RE_DESC_PARTITION_NAME.findall(info_raw) if p == target)
+
+def descriptor_types_for_partition(info_raw: str, part_name: str) -> List[str]:
+    """
+    解析 avbtool info_image 文本，提取目标分区在 descriptor 中出现的类型：hash / hashtree。
+    返回去重后的有序列表。
+    """
+    target = part_name.strip()
+    if not target:
+        return []
+
+    out: List[str] = []
+    current_desc_type: Optional[str] = None
+    for line in info_raw.splitlines():
+        s = line.strip()
+        if s == "Hash descriptor:":
+            current_desc_type = "hash"
+            continue
+        if s == "Hashtree descriptor:":
+            current_desc_type = "hashtree"
+            continue
+
+        m = RE_PART_NAME.match(line)
+        if m and current_desc_type and m.group(1) == target and current_desc_type not in out:
+            out.append(current_desc_type)
+    return out
+
+def verify_parent_vbmeta_safety(
+    before_vbmeta: Path,
+    after_vbmeta: Path,
+    partition_name: str,
+    parent_key: Path,
+    keys: List[Dict],
+    expected_parent_algo: str,
+    expected_size: int,
+) -> None:
+    """
+    NONE 模式最终安全校验：
+    1) 自动调用 info_image 做前后对比
+    2) 自动确认目标 descriptor 唯一（after == 1）
+    3) 自动确认签名 key 匹配（after 顶层公钥 sha1 == parent_key）
+    4) 自动确认 vbmeta 尺寸一致（文件大小不变）
+    """
+    before = info_image(before_vbmeta)
+    after = info_image(after_vbmeta)
+
+    before_cnt = descriptor_partition_count(before["raw"], partition_name)
+    after_cnt = descriptor_partition_count(after["raw"], partition_name)
+
+    expected_key_sha1 = None
+    for k in keys:
+        if Path(k.get("path")).resolve() == parent_key.resolve():
+            expected_key_sha1 = (k.get("sha1") or "").lower()
+            break
+
+    after_key_sha1 = (after.get("top_sha1") or "").lower()
+    after_algo = (after.get("algorithm") or "")
+    after_size = after_vbmeta.stat().st_size
+    after_refs = after.get("referenced_parts") or []
+
+    before_desc_types = descriptor_types_for_partition(before["raw"], partition_name)
+    after_desc_types = descriptor_types_for_partition(after["raw"], partition_name)
+    expected_desc_type = before_desc_types[0] if len(before_desc_types) == 1 else None
+    actual_desc_type = after_desc_types[0] if len(after_desc_types) == 1 else None
+
+    checks = [
+        ("descriptor 唯一性", after_cnt == 1, f"before={before_cnt}, after={after_cnt}"),
+        (
+            "覆盖关系",
+            partition_name in after_refs,
+            f"{partition_name} in referenced_partitions",
+        ),
+        (
+            "key 匹配",
+            bool(expected_key_sha1) and after_key_sha1 == expected_key_sha1,
+            f"expected_sha1={expected_key_sha1 or '(missing)'}, after_sha1={after_key_sha1 or '(missing)'}",
+        ),
+        (
+            "descriptor 类型",
+            bool(expected_desc_type) and bool(actual_desc_type) and expected_desc_type == actual_desc_type,
+            f"expected={expected_desc_type or before_desc_types or '(missing)'}, actual={actual_desc_type or after_desc_types or '(missing)'}",
+        ),
+        (
+            "算法一致性",
+            bool(expected_parent_algo) and after_algo.upper() == expected_parent_algo.upper(),
+            f"expected_algo={expected_parent_algo}, after_algo={after_algo or '(missing)'}",
+        ),
+        (
+            "vbmeta 尺寸一致",
+            after_size == expected_size,
+            f"expected_size={expected_size}, after_size={after_size}",
+        ),
+    ]
+
+    print_banner("刷机安全评估报告")
+    print(f"[*] Parent vbmeta: {after_vbmeta}")
+    print(f"[*] Partition   : {partition_name}")
+    for name, ok, detail in checks:
+        mark = "PASS" if ok else "FAIL"
+        print(f"[{mark}] {name}: {detail}")
+
+    print(f"[*] Manual hint : python avbtool.py info_image --image {after_vbmeta} | findstr /i \"vendor_boot descriptor Partition Name\"")
+
+    failed = [f"{name}({detail})" for name, ok, detail in checks if not ok]
+    if failed:
+        die("安全评估未通过：" + "；".join(failed))
 
 def try_erase_footer(img: Path, show_stdout: bool) -> None:
     code, out, err = run_avbtool(["erase_footer", "--image", str(img)])
@@ -572,6 +691,7 @@ def main():
     out_parent = out_dir / parent_vbmeta.name
     shutil.copy2(parent_vbmeta, out_parent)
     backup_file(out_parent)
+    parent_size_before = out_parent.stat().st_size
     print(f"[*] 已复制父 vbmeta 到输出目录: {out_parent}")
 
     # 1) 先把父 vbmeta 的旧 descriptor 去掉（只改 descriptors_size 和 descriptors 区内部，不改变文件大小）
@@ -677,6 +797,16 @@ def main():
 
         out_parent.write_bytes(new_padded)
         print(f"[+] Signed & padded parent vbmeta: {out_parent}")
+
+    verify_parent_vbmeta_safety(
+        before_vbmeta=parent_vbmeta,
+        after_vbmeta=out_parent,
+        partition_name=partition_name,
+        parent_key=parent_key,
+        keys=keys,
+        expected_parent_algo=parent_algo,
+        expected_size=parent_size_before,
+    )
 
     print("[✓] Done.")
 
