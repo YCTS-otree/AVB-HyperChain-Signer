@@ -624,10 +624,27 @@ def main():
 
         code, out, err = run_avbtool(cmd)
         if code != 0 or not extra_desc.exists():
-            die(
-                "生成 descriptor-vbmeta 失败（可能是 avbtool 对 algorithm=NONE 的行为有差异）。\n"
-                f"CMD: {' '.join(cmd)}\nSTDOUT:\n{out}\nSTDERR:\n{err}"
-            )
+            # 某些 avbtool 版本在 --do_not_append_vbmeta_image 时会把 image 以只读模式打开，
+            # 但内部仍尝试 truncate()，导致 "ImageHandler is in read-only mode"。
+            # 兜底策略：复制一份临时镜像并重试（去掉 do_not_append，允许改临时文件）。
+            retry_cmd = [x for x in cmd if x != "--do_not_append_vbmeta_image"]
+            retry_img = td / f"{img.stem}.desc_work{img.suffix}"
+            shutil.copy2(img, retry_img)
+
+            # 把 --image 参数替换成临时副本。
+            for i in range(len(retry_cmd) - 1):
+                if retry_cmd[i] == "--image":
+                    retry_cmd[i + 1] = str(retry_img)
+                    break
+
+            print("[!] descriptor-vbmeta 首次生成失败，尝试兼容模式重试（临时镜像）")
+            code2, out2, err2 = run_avbtool(retry_cmd)
+            if code2 != 0 or not extra_desc.exists():
+                die(
+                    "生成 descriptor-vbmeta 失败（可能是 avbtool 对 algorithm=NONE 的行为有差异）。\n"
+                    f"CMD: {' '.join(cmd)}\nSTDOUT:\n{out}\nSTDERR:\n{err}\n\n"
+                    f"RETRY CMD: {' '.join(retry_cmd)}\nSTDOUT:\n{out2}\nSTDERR:\n{err2}"
+                )
         print(f"[+] Built descriptor vbmeta for {partition_name} ({desc_mode})")
 
         # 3) 重建并签名父 vbmeta（小体积产物）
