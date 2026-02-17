@@ -607,6 +607,8 @@ def main():
                 "--partition_size", str(partition_size),
                 "--algorithm", "NONE",
                 "--key", str(parent_key),
+                # 显式给空 salt，避免某些环境（如 Windows）无 /dev/urandom 导致失败。
+                "--salt", "",
                 "--output_vbmeta_image", str(extra_desc),
                 "--do_not_append_vbmeta_image",
             ]
@@ -618,6 +620,8 @@ def main():
                 "--partition_size", str(partition_size),
                 "--algorithm", "NONE",
                 "--key", str(parent_key),
+                # 显式给空 salt，避免某些环境（如 Windows）无 /dev/urandom 导致失败。
+                "--salt", "",
                 "--output_vbmeta_image", str(extra_desc),
                 "--do_not_append_vbmeta_image",
             ]
