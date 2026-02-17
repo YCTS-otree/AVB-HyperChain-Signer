@@ -54,16 +54,19 @@ VBMETA_HEADER_FMT = ">4sIIQQIQQQQQQQQQQQIIBB48s80s"
 # 所以我们不用“一把梭 struct unpack 到底”，而是按固定偏移读写关键字段。
 # 关键字段偏移（字节）：
 # magic(0) 4
-# auth_size(16) u64
-# aux_size(24) u64
-# descriptors_offset(120) u64
-# descriptors_size(128) u64
+# auth_size(12) u64
+# aux_size(20) u64
+# descriptors_offset(96) u64
+# descriptors_size(104) u64
 # header size = 256
 OFF_MAGIC = 0
-OFF_AUTH_SIZE = 16
-OFF_AUX_SIZE = 24
-OFF_DESC_OFF = 120
-OFF_DESC_SIZE = 128
+
+OFF_AUTH_SIZE = 12   # u64 big-endian
+OFF_AUX_SIZE  = 20   # u64 big-endian
+
+OFF_DESC_OFF  = 96   # u64 big-endian (relative to aux block start)
+OFF_DESC_SIZE = 104  # u64 big-endian
+
 HEADER_SIZE = 256
 
 def u64be(b: bytes) -> int:
@@ -295,7 +298,12 @@ def vbmeta_strip_partition_descriptors_keep_size(vbmeta_bytes: bytes, target_par
     desc_end = desc_start + desc_size
 
     if desc_end > len(vbmeta_bytes):
-        raise ValueError("vbmeta descriptors 区域越界（文件可能被裁剪，不是完整 RAW 分区镜像？）")
+        raise ValueError(
+            f"vbmeta descriptors 区域越界：desc_end={desc_end}, file_size={len(vbmeta_bytes)}\n"
+            f"auth_size={auth_size}, aux_size={aux_size}, desc_off={desc_off}, desc_size={desc_size}\n"
+            "常见原因：header 偏移错误 / vbmeta 文件损坏 / 不是标准 vbmeta.img"
+        )
+
 
     target = (target_part.encode("ascii") + b"\x00")
 
