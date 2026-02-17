@@ -1,6 +1,8 @@
 # AVB-HyperChain-Signer
 ### AVB Aggregated Automatic Chain Signing Engine
 
+[中文说明（README.zh-CN.md）](./README.zh-CN.md)
+
 AVB HyperChain Signer is a full-chain Android Verified Boot (AVB) signing engine designed for serious firmware modification workflows.
 
 It automatically:
