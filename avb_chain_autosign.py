@@ -88,7 +88,15 @@ def run_avbtool(args_list: List[str]) -> Tuple[int, str, str]:
     if not avbtool.exists():
         raise FileNotFoundError(f"找不到 avbtool.py：{avbtool}")
     cmd = [sys.executable, str(avbtool)] + args_list
+    print(f"\n[>] run_avbtool: {' '.join(cmd)}")
     r = subprocess.run(cmd, capture_output=True, text=True)
+    print(f"[<] returncode: {r.returncode}")
+    if r.stdout.strip():
+        print("[<] stdout:")
+        print(r.stdout.rstrip())
+    if r.stderr.strip():
+        print("[<] stderr:")
+        print(r.stderr.rstrip())
     return r.returncode, r.stdout, r.stderr
 
 def clean_keys(inputs: List[str]) -> List[Path]:
@@ -126,18 +134,26 @@ def extract_pubkey_bin_from_pem(pem: Path, out_bin: Path) -> None:
 
 def load_keys(pem_files: List[Path]) -> List[Dict]:
     keys: List[Dict] = []
+    print(f"[*] 正在解析 key 文件，总计候选: {len(pem_files)}")
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         for pem in pem_files:
             try:
                 pubbin = td / (pem.stem + ".pub.bin")
                 extract_pubkey_bin_from_pem(pem, pubbin)
+                pub_sha1 = hash_file(pubbin, "sha1")
+                pub_sha256 = hash_file(pubbin, "sha256")
                 keys.append({
                     "path": pem,
-                    "sha1": hash_file(pubbin, "sha1"),
+                    "sha1": pub_sha1,
+                    "sha256": pub_sha256,
                 })
+                print(
+                    f"[+] Key OK: {pem.name} | pubkey_sha1={pub_sha1} | pubkey_sha256={pub_sha256}"
+                )
             except Exception:
                 # 非 PEM 私钥格式就跳过
+                print(f"[-] Key skipped (非可用 PEM 私钥): {pem}")
                 continue
     return keys
 
@@ -186,7 +202,7 @@ def info_image(img: Path) -> Dict:
     if m:
         rb_loc = int(m.group(1))
     referenced_parts = sorted(set(m.group(1) for m in RE_ANY_PARTITION_NAME.finditer(out)))
-    return {
+    info = {
         "raw": out,
         "algorithm": algo,
         "top_sha1": top_sha1,
@@ -197,6 +213,14 @@ def info_image(img: Path) -> Dict:
         "use_hash": bool(RE_HASH_DESC.search(out)),
         "referenced_parts": referenced_parts,
     }
+    print(
+        "[*] info_image parsed: "
+        f"image={img.name}, algorithm={info['algorithm']}, top_sha1={info['top_sha1']}, "
+        f"partition_name={info['partition_name']}, partition_size={info['partition_size']}, "
+        f"rollback_index_location={info['rollback_index_location']}, use_hash={info['use_hash']}, "
+        f"use_hashtree={info['use_hashtree']}, referenced_parts={info['referenced_parts']}"
+    )
+    return info
 
 def try_erase_footer(img: Path) -> None:
     code, out, err = run_avbtool(["erase_footer", "--image", str(img)])
@@ -271,6 +295,14 @@ def vbmeta_strip_partition_descriptors_keep_size(vbmeta_bytes: bytes, target_par
     if desc_end > len(vbmeta_bytes):
         raise ValueError("vbmeta descriptors 区域越界（文件可能被裁剪，不是完整 RAW 分区镜像？）")
 
+    print(
+        "[*] vbmeta header关键字段: "
+        f"auth_size={auth_size}, aux_size={aux_size}, "
+        f"desc_off={desc_off}, desc_size={desc_size}, "
+        f"aux_start={aux_start}, desc_start={desc_start}, desc_end={desc_end}, "
+        f"image_size={len(vbmeta_bytes)}"
+    )
+
     target = (target_part.encode("ascii") + b"\x00")
 
     # descriptor 格式：tag(u64) + num_bytes_following(u64) + payload(num_bytes_following)
@@ -287,8 +319,12 @@ def vbmeta_strip_partition_descriptors_keep_size(vbmeta_bytes: bytes, target_par
             # 剩余区域可能是 padding 0，直接停止
             break
         payload = vbmeta_bytes[i+16:rec_end]
+        print(
+            f"[*] descriptor scan: offset={i}, tag={tag}, payload_len={nbf}, rec_len={rec_len}, rec_end={rec_end}"
+        )
         if target in payload:
             removed += 1
+            print(f"[+] descriptor removed: contains partition marker {target_part!r}")
         else:
             kept += vbmeta_bytes[i:rec_end]
         i = rec_end
@@ -390,11 +426,18 @@ def main():
     key_candidates = clean_keys(args.keys)
     if not key_candidates:
         die("没有找到任何 key 文件（.pem/.key/.pk8）")
+    print("[*] key candidates:")
+    for kp in key_candidates:
+        print(f"    - {kp}")
 
     keys = load_keys(key_candidates)
     if not keys:
         die("没有任何 key 能通过 avbtool extract_public_key（请确认 PEM 私钥格式）")
     print(f"[*] Loaded usable keys: {len(keys)}")
+    for k in keys:
+        print(
+            f"    - key={k['path'].name}, sha1={k['sha1']}, sha256={k['sha256']}"
+        )
 
     img_info = info_image(img)
     orig_info = info_image(orig)
@@ -419,6 +462,10 @@ def main():
 
     # 匹配 key（优先 orig）
     key_pem = match_key_sha1(orig_info.get("top_sha1"), keys) or match_key_sha1(img_info.get("top_sha1"), keys)
+    print(
+        f"[*] Key match inputs: orig_top_sha1={orig_info.get('top_sha1')}, "
+        f"img_top_sha1={img_info.get('top_sha1')}, matched_key={(key_pem.name if key_pem else None)}"
+    )
 
     # ---------------- Case 1: Algorithm != NONE -> sign image itself ----------------
     if algorithm.upper() != "NONE":
@@ -462,9 +509,14 @@ def main():
         try:
             vi = info_image(v)
         except Exception:
+            print(f"[-] 跳过无法解析的 vbmeta: {v}")
             continue
         if partition_name in vi.get("referenced_parts", []):
             candidates.append((v, vi))
+            print(
+                f"[+] vbmeta candidate: {v.name}, algorithm={vi.get('algorithm')}, "
+                f"top_sha1={vi.get('top_sha1')}"
+            )
 
     if not candidates:
         die(f"没有任何提供的 vbmeta 引用分区 {partition_name}。请补齐更多 *vbmeta*.img。")
