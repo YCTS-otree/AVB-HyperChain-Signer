@@ -239,6 +239,31 @@ def descriptor_partition_count(info_raw: str, part_name: str) -> int:
         return 0
     return sum(1 for p in RE_DESC_PARTITION_NAME.findall(info_raw) if p == target)
 
+def descriptor_types_for_partition(info_raw: str, part_name: str) -> List[str]:
+    """
+    解析 avbtool info_image 文本，提取目标分区在 descriptor 中出现的类型：hash / hashtree。
+    返回去重后的有序列表。
+    """
+    target = part_name.strip()
+    if not target:
+        return []
+
+    out: List[str] = []
+    current_desc_type: Optional[str] = None
+    for line in info_raw.splitlines():
+        s = line.strip()
+        if s == "Hash descriptor:":
+            current_desc_type = "hash"
+            continue
+        if s == "Hashtree descriptor:":
+            current_desc_type = "hashtree"
+            continue
+
+        m = RE_PART_NAME.match(line)
+        if m and current_desc_type and m.group(1) == target and current_desc_type not in out:
+            out.append(current_desc_type)
+    return out
+
 def verify_parent_vbmeta_safety(
     before_vbmeta: Path,
     after_vbmeta: Path,
@@ -270,13 +295,29 @@ def verify_parent_vbmeta_safety(
     after_key_sha1 = (after.get("top_sha1") or "").lower()
     after_algo = (after.get("algorithm") or "")
     after_size = after_vbmeta.stat().st_size
+    after_refs = after.get("referenced_parts") or []
+
+    before_desc_types = descriptor_types_for_partition(before["raw"], partition_name)
+    after_desc_types = descriptor_types_for_partition(after["raw"], partition_name)
+    expected_desc_type = before_desc_types[0] if len(before_desc_types) == 1 else None
+    actual_desc_type = after_desc_types[0] if len(after_desc_types) == 1 else None
 
     checks = [
         ("descriptor 唯一性", after_cnt == 1, f"before={before_cnt}, after={after_cnt}"),
         (
+            "覆盖关系",
+            partition_name in after_refs,
+            f"{partition_name} in referenced_partitions",
+        ),
+        (
             "key 匹配",
             bool(expected_key_sha1) and after_key_sha1 == expected_key_sha1,
             f"expected_sha1={expected_key_sha1 or '(missing)'}, after_sha1={after_key_sha1 or '(missing)'}",
+        ),
+        (
+            "descriptor 类型",
+            bool(expected_desc_type) and bool(actual_desc_type) and expected_desc_type == actual_desc_type,
+            f"expected={expected_desc_type or before_desc_types or '(missing)'}, actual={actual_desc_type or after_desc_types or '(missing)'}",
         ),
         (
             "算法一致性",
