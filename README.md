@@ -95,7 +95,7 @@ project/
  ├── avb_chain_autosign.py
  ├── avbtool.py
  ├── pem/
- └── vbmeta*.img
+ └── vbmeta/vbmeta*.img
 ```
 
 ---
@@ -130,7 +130,7 @@ python avb_chain_autosign.py \
   --keys ./pem \
   --orig_img ./vendor_boot_b.img \
   --img_patched ./vendor_boot_patched.img \
-  --vbmeta_dir .
+  --vbmeta_dir ./vbmeta
 ```
 
 What happens:
