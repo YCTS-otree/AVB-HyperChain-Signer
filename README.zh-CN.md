@@ -93,7 +93,7 @@ project/
  ├── avb_chain_autosign.py
  ├── avbtool.py
  ├── pem/
- └── vbmeta*.img
+ └── vbmeta/vbmeta*.img
 ```
 
 ---
@@ -128,7 +128,7 @@ python avb_chain_autosign.py \
   --keys ./pem \
   --orig_img ./vendor_boot_b.img \
   --img_patched ./vendor_boot_patched.img \
-  --vbmeta_dir .
+  --vbmeta_dir ./vbmeta
 ```
 
 执行流程：
@@ -195,7 +195,7 @@ python avb_chain_autosign.py \
 
 - 理解 AVB 信任链
 - 在已解锁 bootloader 的设备上操作
-- 使用 RAW 分区 dump
+- **使用 RAW 分区 dump**
 
 错误使用可能导致设备变砖。
 
